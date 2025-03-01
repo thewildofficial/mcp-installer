@@ -6,10 +6,10 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import * as os from "os";
-import * as fs from "fs";
-import * as path from "path";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { spawnPromise } from "spawn-rx";
+import * as yaml from 'js-yaml';
 
 const server = new Server(
   {
@@ -76,6 +76,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["path"],
         },
       },
+      {
+        name: "fix_installer_extension",
+        description: "Fix the installer extension configuration in Goose",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      }
     ],
   };
 });
@@ -107,56 +115,49 @@ async function isNpmPackage(name: string) {
   }
 }
 
-function installToClaudeDesktop(
-  name: string,
+function installToGooseExtensions(
+ name: string,
   cmd: string,
   args: string[],
   env?: string[]
 ) {
-  const configPath =
-    process.platform === "win32"
-      ? path.join(
-          os.homedir(),
-          "AppData",
-          "Roaming",
-          "Claude",
-          "claude_desktop_config.json"
-        )
-      : path.join(
-          os.homedir(),
-          "Library",
-          "Application Support",
-          "Claude",
-          "claude_desktop_config.json"
-        );
+  const configPath = process.env.HOME + "/.config/goose/config.yaml";
 
+  // Read and parse existing YAML config
   let config: any;
   try {
-    config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    const configContent = fs.readFileSync(configPath, "utf8");
+    config = yaml.load(configContent);
   } catch (e) {
     config = {};
+  }
+
+  // Initialize extensions if it doesn't exist
+  if (!config.extensions) {
+    config.extensions = {};
   }
 
   const envObj = (env ?? []).reduce((acc, val) => {
     const [key, value] = val.split("=");
     acc[key] = value;
-
     return acc;
   }, {} as Record<string, string>);
 
-  const newServer = {
-    command: cmd,
+  // Add or update the extension entry
+  config.extensions[name] = {
+    name: name,
+    cmd: cmd,
     args: args,
-    ...(env ? { env: envObj } : {}),
+    enabled: true,
+    type: "stdio",
+    envs: Object.keys(envObj).length > 0 ? envObj : {}
   };
 
-  const mcpServers = config.mcpServers ?? {};
-  mcpServers[name] = newServer;
-  config.mcpServers = mcpServers;
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+  // Write config back to file in YAML format
+  fs.writeFileSync(configPath, yaml.dump(config, { lineWidth: 120 }));
 }
 
-function installRepoWithArgsToClaudeDesktop(
+function installRepoWithArgsToGoose(
   name: string,
   npmIfTrueElseUvx: boolean,
   args?: string[],
@@ -165,7 +166,7 @@ function installRepoWithArgsToClaudeDesktop(
   // If the name is in a scoped package, we need to remove the scope
   const serverName = /^@.*\//i.test(name) ? name.split("/")[1] : name;
 
-  installToClaudeDesktop(
+  installToGooseExtensions(
     serverName,
     npmIfTrueElseUvx ? "npx" : "uvx",
     [name, ...(args ?? [])],
@@ -218,7 +219,7 @@ async function installLocalMcpServer(
     const servers = await attemptNodeInstall(dirPath);
 
     Object.keys(servers).forEach((name) => {
-      installToClaudeDesktop(
+      installToGooseExtensions(
         name,
         "node",
         [servers[name], ...(args ?? [])],
@@ -230,7 +231,7 @@ async function installLocalMcpServer(
       content: [
         {
           type: "text",
-          text: `Installed the following servers via npm successfully! ${Object.keys(
+          text: `Installed the following servers to Goose extensions successfully! ${Object.keys(
             servers
           ).join(";")} Tell the user to restart the app`,
         },
@@ -267,13 +268,13 @@ async function installRepoMcpServer(
   }
 
   if (await isNpmPackage(name)) {
-    installRepoWithArgsToClaudeDesktop(name, true, args, env);
+    installRepoWithArgsToGoose(name, true, args, env);
 
     return {
       content: [
         {
           type: "text",
-          text: "Installed MCP server via npx successfully! Tell the user to restart the app",
+          text: "Installed MCP server to Goose extensions via npx successfully! Tell the user to restart the app",
         },
       ],
     };
@@ -291,16 +292,69 @@ async function installRepoMcpServer(
     };
   }
 
-  installRepoWithArgsToClaudeDesktop(name, false, args, env);
+  installRepoWithArgsToGoose(name, false, args, env);
 
   return {
     content: [
       {
         type: "text",
-        text: "Installed MCP server via uvx successfully! Tell the user to restart the app",
+        text: "Installed MCP server to Goose extensions via uvx successfully! Tell the user to restart the app",
       },
     ],
   };
+}
+
+async function fixInstallerExtension() {
+  const configPath = process.env.HOME + "/.config/goose/config.yaml";
+  
+  // Read current config
+  try {
+    const configContent = fs.readFileSync(configPath, "utf8");
+    const config = yaml.load(configContent) as any;
+    
+    if (config.extensions && config.extensions.installer) {
+      // Fix the installer extension configuration
+      config.extensions.installer = {
+        name: "installer",
+        cmd: "npx",
+        args: ["@anaisbetts/mcp-installer"], // Use the correct package name
+        enabled: true,
+        envs: {},
+        type: "stdio"
+      };
+      
+      // Write updated config back
+      fs.writeFileSync(configPath, yaml.dump(config));
+      
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Successfully fixed installer extension configuration. Please restart Goose to apply changes."
+          }
+        ]
+      };
+    } else {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Installer extension not found in config. Adding it now."
+          }
+        ]
+      };
+    }
+  } catch (e) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Error fixing installer extension: ${e}`
+        }
+      ],
+      isError: true
+    };
+  }
 }
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -323,6 +377,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
 
       return await installLocalMcpServer(dirPath, args, env);
+    }
+    
+    if (request.params.name === "fix_installer_extension") {
+      return await fixInstallerExtension();
     }
 
     throw new Error(`Unknown tool: ${request.params.name}`);
